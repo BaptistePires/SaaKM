@@ -6,6 +6,7 @@
  *
  *  Copyright (C) 1991-2002  Linus Torvalds
  */
+#include "linux/sched.h"
 #include <linux/highmem.h>
 #include <linux/hrtimer_api.h>
 #include <linux/ktime_api.h>
@@ -92,6 +93,7 @@
 #include "smp.h"
 #include "stats.h"
 
+#include "ipanema.h"
 #include "../workqueue_internal.h"
 #include "../../io_uring/io-wq.h"
 #include "../smpboot.h"
@@ -1207,6 +1209,7 @@ static void nohz_csd_func(void *info)
 	if (rq->idle_balance && !need_resched()) {
 		rq->nohz_idle_balance = flags;
 		raise_softirq_irqoff(SCHED_SOFTIRQ);
+		raise_softirq_irqoff(SCHED_SOFTIRQ_IPANEMA);
 	}
 }
 
@@ -2786,15 +2789,19 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 		lockdep_assert_rq_held(rq);
 		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
 	}
-	if (running)
+	if (running) {
+		p->ipanema.nopreempt = 1;
 		put_prev_task(rq, p);
+	}
 
 	p->sched_class->set_cpus_allowed(p, ctx);
 
 	if (queued)
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
-	if (running)
+	if (running) {
 		set_next_task(rq, p);
+		p->ipanema.nopreempt = 0;
+	}
 }
 
 /*
@@ -3635,7 +3642,7 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
 {
 	lockdep_assert_held(&p->pi_lock);
 
-	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
+	if ((p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) || p->sched_class == &ipanema_sched_class)
 		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
 	else
 		cpu = cpumask_any(p->cpus_ptr);
@@ -4783,12 +4790,16 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		p->sched_reset_on_fork = 0;
 	}
 
-	if (dl_prio(p->prio))
+	/* Pourquoi avant tout le monde (au cas où il y est des taches dans ipanema qui aient des prio correspondant à dl prio?)*/
+	if (task_has_ipanema_policy(p)) {
+		p->sched_class = &ipanema_sched_class;
+	} else if (dl_prio(p->prio)) {
 		return -EAGAIN;
-	else if (rt_prio(p->prio))
+	} else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
-	else
+	} else {
 		p->sched_class = &fair_sched_class;
+	}
 
 	init_entity_runnable_average(&p->se);
 
@@ -5692,6 +5703,7 @@ void scheduler_tick(void)
 #ifdef CONFIG_SMP
 	rq->idle_balance = idle_cpu(cpu);
 	trigger_load_balance(rq);
+	trigger_load_balance_ipanema(rq);
 #endif
 }
 
@@ -7062,7 +7074,11 @@ EXPORT_SYMBOL(default_wake_function);
 
 static void __setscheduler_prio(struct task_struct *p, int prio)
 {
-	if (dl_prio(prio))
+	/* Void avec Redha quels impacts ça peut avoir, j'ai du modifier à cause de
+	__sched_setscheduler. */
+	if (ipanema_policy(p->policy))
+		p->sched_class = &ipanema_sched_class;
+	else if (dl_prio(prio))
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(prio))
 		p->sched_class = &rt_sched_class;
@@ -7192,8 +7208,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	running = task_current(rq, p);
 	if (queued)
 		dequeue_task(rq, p, queue_flag);
-	if (running)
+	if (running) {
+		p->ipanema.nopreempt = 1;
 		put_prev_task(rq, p);
+	}
 
 	/*
 	 * Boosting condition are:
@@ -7204,6 +7222,8 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	 *      --> -dl task blocks on mutex A and could preempt the
 	 *          running task
 	 */
+	if (prev_class == &ipanema_sched_class)
+		goto class_choice;
 	if (dl_prio(prio)) {
 		if (!dl_prio(p->normal_prio) ||
 		    (pi_task && dl_prio(pi_task->prio) &&
@@ -7225,12 +7245,15 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 			p->rt.timeout = 0;
 	}
 
+class_choice:
 	__setscheduler_prio(p, prio);
 
 	if (queued)
 		enqueue_task(rq, p, queue_flag);
-	if (running)
+	if (running) {
 		set_next_task(rq, p);
+		p->ipanema.nopreempt = 0;
+	}
 
 	check_class_changed(rq, p, prev_class, oldprio);
 out_unlock:
@@ -7282,8 +7305,10 @@ void set_user_nice(struct task_struct *p, long nice)
 	running = task_current(rq, p);
 	if (queued)
 		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
-	if (running)
+	if (running) {
+		p->ipanema.nopreempt = 1;
 		put_prev_task(rq, p);
+	}
 
 	p->static_prio = NICE_TO_PRIO(nice);
 	set_load_weight(p, true);
@@ -7292,8 +7317,10 @@ void set_user_nice(struct task_struct *p, long nice)
 
 	if (queued)
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
-	if (running)
+	if (running) {
 		set_next_task(rq, p);
+		p->ipanema.nopreempt = 0;
+	}
 
 	/*
 	 * If the task increased its priority or is running and
@@ -7593,6 +7620,8 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+	else if (ipanema_policy(policy))
+		__setparam_ipanema(p, attr);
 
 	/*
 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
@@ -7693,6 +7722,7 @@ static int __sched_setscheduler(struct task_struct *p,
 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
 	struct rq *rq;
 	bool cpuset_locked = false;
+	int ipa_policy;
 
 	/* The pi code expects interrupts enabled */
 	BUG_ON(pi && in_interrupt());
@@ -7770,6 +7800,54 @@ recheck:
 	}
 
 	/*
+	 * If switching to SCHED_IPANEMA, check that the ipanema policy exists
+	 * and check cgroups to see if it's ok
+	 */
+	ipa_policy = attr->sched_ipa_policy;
+	if (ipanema_policy(policy)) {
+		struct ipanema_policy *cur_policy = NULL;
+		int found = 0;
+#ifdef CONFIG_CGROUP_IPANEMA
+		struct cgroup_subsys_state *css;
+		struct ipanema_group *ipa_grp;
+		struct ipanema_policy *cgrp_policy;
+#endif	/* CONFIG_CGROUP_IPANEMA */
+
+		if (attr->sched_ipa_policy == -1 && ipanema_task_policy(p))
+			ipa_policy = ipanema_task_policy(p)->id;
+
+#ifdef CONFIG_CGROUP_IPANEMA
+		/*
+		 * If process is in an ipanema cgroup, check that it is not
+		 * moving to another ipanema policy
+		 */
+		css = p->cgroups->subsys[ipanema_cgrp_id];
+		ipa_grp = ipanema_group_of(css);
+		cgrp_policy = ipa_grp->policy;
+		if (cgrp_policy) {
+			if (ipa_policy != cgrp_policy->id) {
+				retval = -EINVAL;
+				goto unlock;
+			}
+		}
+#endif	/* CONFIG_CGROUP_IPANEMA */
+
+		read_lock(&ipanema_rwlock);
+		list_for_each_entry(cur_policy, &ipanema_policies, list) {
+			if (cur_policy->id == ipa_policy) {
+				found = 1;
+				ipanema_task_policy(p) = cur_policy;
+				break;
+			}
+		}
+		read_unlock(&ipanema_rwlock);
+		if (!found || !__checkparam_ipanema(attr, cur_policy)) {
+			retval = -EINVAL;
+			goto unlock;
+		}
+	}
+
+	/*
 	 * If not changing anything there's no need to proceed further,
 	 * but store a possible modification of reset_on_fork.
 	 */
@@ -7780,6 +7858,15 @@ recheck:
 			goto change;
 		if (dl_policy(policy) && dl_param_changed(p, attr))
 			goto change;
+		if (ipanema_policy(policy) && ipanema_task_policy(p)) {
+			if (ipa_policy != ipanema_task_policy(p)->id) {
+				queue_flags |= SWITCHING_CLASS;
+				goto change;
+			} else if (ipanema_attr_changed(p, attr)) {
+				queue_flags |= ATTR_CHANGE;
+				goto change;
+			}
+		}
 		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
 			goto change;
 
@@ -7787,6 +7874,24 @@ recheck:
 		retval = 0;
 		goto unlock;
 	}
+
+	/* If moving out from ipanema, set the SWITCHING_CLASS flag */
+	if (ipanema_policy(p->policy)) {
+#ifdef CONFIG_CGROUP_IPANEMA
+		struct cgroup_subsys_state *css;
+		struct ipanema_group *ipa_grp;
+
+		css = p->cgroups->subsys[ipanema_cgrp_id];
+		ipa_grp = ipanema_group_of(css);
+		if (ipa_grp->policy) {
+			retval = -EINVAL;
+			goto unlock;
+		}
+#endif	/* CONFIG_CGROUP_IPANEMA */
+
+		queue_flags |= SWITCHING_CLASS;
+	}
+
 change:
 
 	if (user) {
@@ -7859,10 +7964,19 @@ change:
 
 	queued = task_on_rq_queued(p);
 	running = task_current(rq, p);
-	if (queued)
+	
+	/*
+	 * We also call dequeue_task() on tasks that use the ipanema sched class
+	 * if they are switching class to force the call to the terminate()
+	 * handler, and decrease the refcnt of the ipanema policy module. It is
+	 * kind of hacky, but it works.
+	 */
+	if (queued || (ipanema_policy(p->policy) && queue_flags & SWITCHING_CLASS))
 		dequeue_task(rq, p, queue_flags);
-	if (running)
+	if (running) {
+		p->ipanema.nopreempt = 1;
 		put_prev_task(rq, p);
+	}
 
 	prev_class = p->sched_class;
 
@@ -7882,8 +7996,10 @@ change:
 
 		enqueue_task(rq, p, queue_flags);
 	}
-	if (running)
+	if (running) {
 		set_next_task(rq, p);
+		p->ipanema.nopreempt = 0;
+	}
 
 	check_class_changed(rq, p, prev_class, oldprio);
 
@@ -8077,6 +8193,22 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
 	 */
 	attr->sched_nice = clamp(attr->sched_nice, MIN_NICE, MAX_NICE);
 
+	/* Copy attributes of the ipanema policy of necessary */
+	if (ipanema_policy(attr->sched_policy) &&
+	    attr->sched_ipa_attr_size > 0) {
+		attr->sched_ipa_attr = kzalloc(attr->sched_ipa_attr_size,
+					       GFP_KERNEL);
+		if (!attr->sched_ipa_attr)
+			return -ENOMEM;
+		ret = copy_from_user(attr->sched_ipa_attr,
+				     uattr->sched_ipa_attr,
+				     attr->sched_ipa_attr_size);
+		if (ret) {
+			kfree(attr->sched_ipa_attr);
+			return -EFAULT;
+		}
+	}
+
 	return 0;
 
 err_size:
@@ -8088,6 +8220,8 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
 {
 	if (task_has_dl_policy(p))
 		__getparam_dl(p, attr);
+	else if (task_has_ipanema_policy(p))
+		attr->sched_ipa_policy = ipanema_task_policy(p)->id;
 	else if (task_has_rt_policy(p))
 		attr->sched_priority = p->rt_priority;
 	else
@@ -8147,6 +8281,11 @@ SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
 		attr.sched_policy = SETPARAM_POLICY;
 
 	CLASS(find_get_task, p)(pid);
+
+	/* Free ipanema attr if necessary */
+	if (ipanema_policy(attr.sched_policy))
+		kfree(attr.sched_ipa_attr);
+
 	if (!p)
 		return -ESRCH;
 
@@ -9046,6 +9185,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+	case SCHED_IPANEMA:
 		ret = 0;
 		break;
 	}
@@ -9073,6 +9213,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+	case SCHED_IPANEMA:
 		ret = 0;
 	}
 	return ret;
@@ -9378,15 +9519,19 @@ void sched_setnuma(struct task_struct *p, int nid)
 
 	if (queued)
 		dequeue_task(rq, p, DEQUEUE_SAVE);
-	if (running)
+	if (running) {
+		p->running.nopreempt = 1;
 		put_prev_task(rq, p);
+	}
 
 	p->numa_preferred_nid = nid;
 
 	if (queued)
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
-	if (running)
+	if (running) {
 		set_next_task(rq, p);
+		p->ipanema.nopreempt = 0;
+	}
 	task_rq_unlock(rq, p, &rf);
 }
 #endif /* CONFIG_NUMA_BALANCING */
@@ -9967,6 +10112,7 @@ void __init sched_init(void)
 		rq = cpu_rq(i);
 		raw_spin_lock_init(&rq->__lock);
 		rq->nr_running = 0;
+		rq->nr_ipanema_running = 0;
 		rq->calc_load_active = 0;
 		rq->calc_load_update = jiffies + LOAD_FREQ;
 		init_cfs_rq(&rq->cfs);
@@ -10076,6 +10222,7 @@ void __init sched_init(void)
 	balance_push_set(smp_processor_id(), false);
 #endif
 	init_sched_fair_class();
+	init_sched_ipanema_class();
 
 	psi_init();
 
@@ -10484,8 +10631,10 @@ void sched_move_task(struct task_struct *tsk)
 
 	if (queued)
 		dequeue_task(rq, tsk, queue_flags);
-	if (running)
+	if (running) {
+		tsk->ipanema.nopreempt = 1;
 		put_prev_task(rq, tsk);
+	}
 
 	sched_change_group(tsk, group);
 
@@ -10493,6 +10642,8 @@ void sched_move_task(struct task_struct *tsk)
 		enqueue_task(rq, tsk, queue_flags);
 	if (running) {
 		set_next_task(rq, tsk);
+		/* TODO */
+		tsk->ipanema.nopreempt = 0;
 		/*
 		 * After changing group, the running task may have joined a
 		 * throttled one but it's still the running task. Trigger a

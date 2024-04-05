@@ -745,6 +745,67 @@ struct kmap_ctrl {
 #endif
 };
 
+enum ipanema_state {
+	IPANEMA_NOT_QUEUED,
+	IPANEMA_MIGRATING,
+	IPANEMA_RUNNING,
+	IPANEMA_READY,
+	IPANEMA_BLOCKED,
+	IPANEMA_TERMINATED,
+	/*
+	 * A special state that is equivalent to IPANEMA_READY, but makes it
+	 * possible to figure out that the state change came from tick().
+	 */
+	IPANEMA_READY_TICK
+};
+
+static inline const char *
+ipanema_state_to_str(const enum ipanema_state s)
+{
+	switch (s) {
+	case IPANEMA_NOT_QUEUED:
+		return "IPANEMA_NOT_QUEUED";
+	case IPANEMA_MIGRATING:
+		return "IPANEMA_MIGRATING";
+	case IPANEMA_RUNNING:
+		return "IPANEMA_RUNNING";
+	case IPANEMA_READY:
+		return "IPANEMA_READY";
+	case IPANEMA_BLOCKED:
+		return "IPANEMA_BLOCKED";
+	case IPANEMA_TERMINATED:
+		return "IPANEMA_TERMINATED";
+	case IPANEMA_READY_TICK:
+		return "IPANEMA_READY_TICK";
+	}
+
+	return "UNKNOWN_STATE";
+}
+
+struct ipanema_rq;
+
+struct sched_ipanema_entity {
+	union {
+		struct rb_node node_runqueue;
+		struct list_head node_list;
+	};
+
+	/* used for load balancing in policies */
+	struct list_head ipa_tasks;
+
+	int just_yielded;
+	int nopreempt;
+
+	enum ipanema_state state;
+	struct ipanema_rq *rq;
+
+	/* Policy-specific metadata */
+	void *policy_metadata;
+
+	struct ipanema_policy *policy;
+};
+
+
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 	/*
@@ -798,6 +859,7 @@ struct task_struct {
 	struct sched_rt_entity		rt;
 	struct sched_dl_entity		dl;
 	struct sched_dl_entity		*dl_server;
+	struct sched_ipanema_entity ipanema;
 	const struct sched_class	*sched_class;
 
 #ifdef CONFIG_SCHED_CORE

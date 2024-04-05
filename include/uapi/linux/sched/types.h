@@ -32,6 +32,7 @@
  *  @sched_policy	task's scheduling policy
  *  @sched_nice		task's nice value      (SCHED_NORMAL/BATCH)
  *  @sched_priority	task's static priority (SCHED_FIFO/RR)
+ *  @sched_ipa_policy   id of the ipanema policy to use (SCHED_IPANEMA)
  *
  * Certain more advanced scheduling features can be controlled by a
  * predefined set of flags via the attribute:
@@ -69,6 +70,10 @@
  * As of now, the SCHED_DEADLINE policy (sched_dl scheduling class) is the
  * only user of this new interface. More information about the algorithm
  * available in the scheduling class file or in Documentation/.
+ *
+ * Ipanema Scheduling Class
+ * ========================
+ * SCHED_IPANEMA uses this interface to allow policy choice.
  *
  * Task Utilization Attributes
  * ===========================
@@ -111,6 +116,11 @@ struct sched_attr {
 	__u64 sched_runtime;
 	__u64 sched_deadline;
 	__u64 sched_period;
+
+	/* SCHED_IPANEMA */
+	__u32 sched_ipa_policy;
+	__u32 sched_ipa_attr_size;
+	void  *sched_ipa_attr;
 
 	/* Utilization hints */
 	__u32 sched_util_min;
